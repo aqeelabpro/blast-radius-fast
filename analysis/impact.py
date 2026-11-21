@@ -393,20 +393,92 @@ class Analyzer:
         # Analyze removed lines
         parts = [self.old_line_tests(path, old_tree, ln) for ln in hunk.removed_lines()]
 
-        # Analyze added lines
+        # Analyze added lines - need new tree for proper context
+        try:
+            new_tree = ast.parse("\n".join(new_lines))
+        except SyntaxError:
+            new_tree = None
+
         for point, new_ln in self._added_positions(hunk):
             if is_code_line(new_lines[new_ln - 1]):
-                # Use neighbors for context
-                neighbors = [
-                    find_next_code_line(old_lines, point - 1, -1),
-                    find_next_code_line(old_lines, point, 1)
-                ]
-                parts.extend(
-                    self.old_line_tests(path, old_tree, n)
-                    for n in neighbors if n is not None
-                )
+                if new_tree:
+                    parts.append(self._insertion_tests(path, old_tree, old_lines, new_tree, new_ln, point))
+                else:
+                    # Fallback: use neighbors
+                    neighbors = [
+                        find_next_code_line(old_lines, point - 1, -1),
+                        find_next_code_line(old_lines, point, 1)
+                    ]
+                    parts.extend(
+                        self.old_line_tests(path, old_tree, n)
+                        for n in neighbors if n is not None
+                    )
 
         return union_results(parts)
+
+    def _insertion_tests(self, path: str, old_tree: ast.AST, old_lines: List[str],
+                         new_tree: ast.AST, new_ln: int, point: int) -> Optional[Set[int]]:
+        """Get tests affected by an inserted line."""
+        new_chain = chain(new_tree, new_ln)
+        funcs = [n for n in new_chain if isinstance(n, FUNC_TYPES)]
+
+        # Not in function: import-time insertion
+        if not funcs:
+            stmts = [n for n in new_chain if isinstance(n, ast.stmt)]
+            stmt = stmts[-1] if stmts else None
+            defining = (path, max(point - 1, 1), point)
+            # Find matching class in old tree
+            classes = [n for n in new_chain if isinstance(n, ast.ClassDef)]
+            if classes:
+                old_cls = self._find_scope(old_tree, [c.name for c in classes])
+                broad = self.broad_selection(path, [old_cls] if old_cls else [])
+            else:
+                broad = self.broad_selection(path, [])
+            return self.narrow_selection(path, stmt, defining, broad)
+
+        # In named function: check if it exists in old tree
+        named = [n for n in new_chain if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if named:
+            qual = [n.name for n in new_chain if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+            old_func = self._find_scope(old_tree, qual)
+            if old_func is None:
+                # New function: use broad selection
+                classes = [n for n in new_chain if isinstance(n, ast.ClassDef)]
+                if classes:
+                    old_cls = self._find_scope(old_tree, [c.name for c in classes])
+                    return self.broad_selection(path, [old_cls] if old_cls else [])
+                return self.broad_selection(path, [])
+            # In decorator/signature
+            if isinstance(named[-1], (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if new_ln < named[-1].body[0].lineno:
+                    return self.range_tests(path, start(old_func), old_func.end_lineno)
+
+        # In function body: use neighbor coverage
+        neighbors = [
+            find_next_code_line(old_lines, point - 1, -1),
+            find_next_code_line(old_lines, point, 1)
+        ]
+        return union_results([
+            self.old_line_tests(path, old_tree, n)
+            for n in neighbors if n is not None
+        ])
+
+    def _find_scope(self, tree: ast.AST, names: List[str]) -> Optional[ast.AST]:
+        """Find a nested scope by qualified name."""
+        if not names:
+            return None
+        current = tree
+        for name in names:
+            found = None
+            for child in ast.iter_child_nodes(current):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if child.name == name:
+                        found = child
+                        break
+            if found is None:
+                return None
+            current = found
+        return current
 
     def _added_positions(self, hunk: Hunk) -> List[tuple]:
         """Get (old_insertion_point, new_line_number) for added lines."""
