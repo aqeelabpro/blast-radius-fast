@@ -4,6 +4,7 @@ Extracts file changes and line numbers from patches.
 """
 from __future__ import annotations
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -71,15 +72,31 @@ def parse_patch(text: str) -> List[FileDiff]:
                 results.append(current)
             current = FileDiff(None, None)
             hunk = None
+            # Rename-only diffs have no ---/+++ pair, so retain header paths.
+            try:
+                fields = shlex.split(line)
+                if len(fields) >= 4:
+                    old_path = fields[2][2:] if fields[2].startswith("a/") else fields[2]
+                    new_path = fields[3][2:] if fields[3].startswith("b/") else fields[3]
+                    current.old_path = old_path
+                    current.new_path = new_path
+            except ValueError:
+                pass
+
+        elif line.startswith("rename from ") and current is not None:
+            current.old_path = line[len("rename from "):].strip().strip('"')
+
+        elif line.startswith("rename to ") and current is not None:
+            current.new_path = line[len("rename to "):].strip().strip('"')
 
         elif line.startswith("--- ") and current is not None:
-            path = line[4:].strip()
+            path = line[4:].split("\t", 1)[0].strip()
             if path.startswith("a/"):
                 path = path[2:]
             current.old_path = None if path == "/dev/null" else path
 
         elif line.startswith("+++ ") and current is not None:
-            path = line[4:].strip()
+            path = line[4:].split("\t", 1)[0].strip()
             if path.startswith("b/"):
                 path = path[2:]
             current.new_path = None if path == "/dev/null" else path
@@ -113,7 +130,9 @@ def apply_hunks(source_lines: List[str], hunks: List[Hunk]) -> List[str]:
     offset = 0
 
     for h in sorted(hunks, key=lambda x: x.old_start):
-        pos = h.old_start - 1 + offset
+        # Zero-length old ranges use old_start as the number of preceding lines.
+        # Non-empty ranges use the normal 1-based unified-diff line number.
+        pos = (h.old_start if h.old_len == 0 else h.old_start - 1) + offset
 
         # Count removals
         rm_count = sum(1 for ln in h.lines if ln.startswith("-") or ln.startswith(" "))

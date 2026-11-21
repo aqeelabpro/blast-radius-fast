@@ -5,6 +5,7 @@ Determines which tests are affected by code changes.
 from __future__ import annotations
 import ast
 import os
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, FrozenSet, Union
 
@@ -34,6 +35,8 @@ class Maps:
     enums: FrozenSet[str] = frozenset()
     import_lines: Dict[str, List[int]] = field(default_factory=dict)
     import_groups: Dict = field(default_factory=dict)
+    source_readers: Optional[Dict[str, Set[int]]] = None
+    source_reader_unknown: Set[int] = field(default_factory=set)
 
 
 def union_results(parts) -> Optional[Set[int]]:
@@ -59,6 +62,33 @@ def find_next_code_line(lines: List[str], idx: int, direction: int) -> Optional[
             return idx
         idx += direction
     return None
+
+
+def is_literal_value(node: Optional[ast.AST]) -> bool:
+    """Return True only for side-effect-free literal values."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+        return isinstance(node.operand, ast.Constant) and isinstance(
+            node.operand.value, (int, float, complex)
+        )
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(is_literal_value(item) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (key is None or is_literal_value(key)) and is_literal_value(value)
+            for key, value in zip(node.keys, node.values)
+        )
+    return False
+
+
+def is_narrowable_assignment(stmt: Optional[ast.AST]) -> bool:
+    """Only narrow assignments whose evaluation cannot have side effects."""
+    if isinstance(stmt, ast.Assign):
+        return is_literal_value(stmt.value)
+    if isinstance(stmt, ast.AnnAssign):
+        return is_literal_value(stmt.value) and isinstance(stmt.annotation, (ast.Name, ast.Constant))
+    return False
 
 
 def get_assigned_names(stmt: ast.AST) -> Optional[List[str]]:
@@ -89,6 +119,13 @@ class Analyzer:
         self.equiv = Equivalence(maps.enums)
         self.readers = ReaderIndex(src_root, maps.import_lines)
         self.import_time: Dict[str, str] = {}
+        # Coverage maps are queried repeatedly for small line ranges. Keep
+        # sorted line indexes so range lookups do not scan every covered line.
+        self._coverage_lines = {
+            path: sorted(line_map) for path, line_map in maps.coverage.items()
+        }
+        self._range_cache: Dict[tuple, FrozenSet[int]] = {}
+        self._file_test_cache: Dict[str, FrozenSet[int]] = {}
 
     def read_source(self, path: str) -> Optional[str]:
         """Read file from source tree."""
@@ -110,17 +147,35 @@ class Analyzer:
         return result
 
     def range_tests(self, path: str, start_ln: int, end_ln: int) -> Set[int]:
-        """Get tests covering line range."""
+        """Get tests covering line range using a sorted per-file line index."""
+        if end_ln < start_ln:
+            return set()
+        key = (path, start_ln, end_ln)
+        cached = self._range_cache.get(key)
+        if cached is not None:
+            return set(cached)
+
         cov = self.maps.coverage.get(path, {})
+        line_numbers = self._coverage_lines.get(path, ())
+        left = bisect_left(line_numbers, start_ln)
+        right = bisect_right(line_numbers, end_ln)
         result: Set[int] = set()
-        for ln, tests in cov.items():
-            if start_ln <= ln <= end_ln:
-                result.update(tests)
+        for line_number in line_numbers[left:right]:
+            result.update(cov[line_number])
+        self._range_cache[key] = frozenset(result)
         return result
 
     def file_tests(self, path: str) -> Set[int]:
-        """Get all tests covering file."""
-        return self.range_tests(path, 0, 10**9)
+        """Get all tests covering a file, cached after the first query."""
+        cached = self._file_test_cache.get(path)
+        if cached is None:
+            cached = frozenset(
+                test_number
+                for tests in self.maps.coverage.get(path, {}).values()
+                for test_number in tests
+            )
+            self._file_test_cache[path] = cached
+        return set(cached)
 
     def fixture_tests(self, path: str) -> Set[int]:
         """Get tests using fixture."""
@@ -147,13 +202,19 @@ class Analyzer:
 
         return tests or ALL
 
+    def source_reader_tests(self, path: str) -> Optional[Set[int]]:
+        """Tests that statically inspect source text for this module."""
+        if self.maps.source_readers is None or path not in self.maps.source_readers:
+            return self.module_tests(path)
+        return set(self.maps.source_readers[path]) | set(self.maps.source_reader_unknown)
+
     def class_users(self, path: str, classes: List[ast.ClassDef]) -> Set[int]:
         """Get tests that instantiate given classes."""
         if not classes:
             return set()
         names = [c.name for c in classes]
         for depth in range(len(names), 0, -1):
-            key = f"{path}::{'::'.join(names[:depth])}"
+            key = f"{path}::{'.'.join(names[:depth])}"
             if key in self.maps.classes:
                 return set(self.maps.classes[key])
         return set()
@@ -202,7 +263,7 @@ class Analyzer:
         names = get_assigned_names(stmt) if stmt else None
         if broad is ALL:
             return ALL
-        if not names or not self.maps.import_lines:
+        if not names or not self.maps.import_lines or not is_narrowable_assignment(stmt):
             return broad
 
         readers: Set[int] = set()
@@ -222,9 +283,16 @@ class Analyzer:
         # Not in function: import-time code
         if not funcs:
             classes = [n for n in nodes if isinstance(n, ast.ClassDef)]
-            broad = self.broad_selection(path, classes)
             stmts = [n for n in nodes if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
+            broad = self.broad_selection(path, classes)
+            # For a literal class attribute, tests that instantiate the
+            # innermost class are a tighter safe bound than every test that
+            # merely imports the containing module.
+            if classes and is_narrowable_assignment(stmt):
+                class_tests = self.class_users(path, classes)
+                if class_tests:
+                    broad = class_tests
             defining = (path, start(stmt), stmt.end_lineno) if stmt else (path, 0, -1)
             return self.narrow_selection(path, stmt, defining, broad)
 
@@ -252,49 +320,44 @@ class Analyzer:
         return union_results([result, ig])
 
     def tests_for(self, diff: FileDiff) -> Optional[Set[int]]:
-        """Determine tests affected by file change."""
+        """Determine tests affected by file change, including renames."""
+        paths = {p for p in (diff.old_path, diff.new_path) if p}
+        # Binary content cannot be safely analyzed by line/AST maps.
+        if diff.binary:
+            return ALL
+        # Dispatch using both sides before applying suffix-based exclusions.
+        if any(p.startswith("tests/fixtures/") for p in paths):
+            return self._handle_fixture(diff)
+        if any(p.startswith("sqlglot/") for p in paths):
+            return self._handle_sqlglot(diff)
+        if any(p.startswith("tests/") and p.endswith(".py") for p in paths):
+            return self._handle_test(diff)
         path = diff.path
-
-        # Skip docs
         if any(path.endswith(ext) for ext in SKIP_EXTS):
             return set()
         if any(path.startswith(d) for d in SKIP_DIRS):
             return set()
-
-        # Fixtures
-        if path.startswith("tests/fixtures/"):
-            return self._handle_fixture(diff)
-
-        # Python
-        if path.endswith(".py"):
-            if path.startswith("sqlglot/"):
-                return self._handle_sqlglot(diff)
-            if path.startswith("tests/"):
-                return self._handle_test(diff)
-
-        # Binary
         if diff.binary:
             return ALL
         return set()
 
     def _handle_fixture(self, diff: FileDiff) -> Set[int]:
-        """Handle fixture changes."""
-        path = diff.path
-        if path.endswith(".sql") and not diff.binary:
-            has_code = False
-            for hunk in diff.hunks:
-                for text in hunk.changed_text():
-                    stripped = text.strip()
-                    if stripped and not stripped.startswith("--"):
-                        has_code = True
-                        break
-            if not has_code:
-                return set()
-        return self.fixture_tests(path)
+        """Handle fixture changes, including both sides of a rename."""
+        paths = {p for p in (diff.old_path, diff.new_path) if p}
+        # Fixture contents can be expected output as well as input SQL. Even
+        # comment-only edits may invalidate snapshots, so never discard them.
+        result: Set[int] = set()
+        for candidate in paths:
+            result |= self.fixture_tests(candidate)
+        return result
 
     def _handle_test(self, diff: FileDiff) -> Set[int]:
-        """Handle test file changes."""
-        return self.maps.tests_by_file.get(diff.path, set())
+        """Handle test file changes, including both sides of a rename."""
+        result: Set[int] = set()
+        for candidate in (diff.old_path, diff.new_path):
+            if candidate:
+                result |= self.maps.tests_by_file.get(candidate, set())
+        return result
 
     def _handle_sqlglot(self, diff: FileDiff) -> Optional[Set[int]]:
         """Handle sqlglot source changes."""
@@ -302,8 +365,9 @@ class Analyzer:
 
         # New file
         if diff.old_path is None:
-            extra = self.maps.tests_by_file.get(TYPING_TEST, set()) if path.startswith(TYPING_PKG) else set()
-            return extra
+            # A new module has no coverage/import map. Existing code may import
+            # it dynamically, so an empty selection cannot be proven safe.
+            return ALL
 
         # Deleted or renamed
         if diff.new_path is None or diff.old_path != diff.new_path:
@@ -331,11 +395,11 @@ class Analyzer:
             self.import_time[path] = new_src
             return ALL
 
-        # Same bytecode or all hunks are equivalent
+        # Equal bytecode does not prove a source edit harmless: tests may
+        # inspect source text, comments, or formatting. Run tests that exercise
+        # this module rather than silently dropping the change.
         if old_key == new_key:
-            return set()
-        if all(self.equiv.same_hunk_text(h, path) for h in diff.hunks):
-            return set()
+            return self.source_reader_tests(path)
 
         # Parse trees
         try:
@@ -380,13 +444,14 @@ class Analyzer:
         if self.equiv.same_hunk_text(hunk, path):
             return set()
 
-        # Try new bytecode comparison
+        # A bytecode-identical hunk may still alter inspectable source text.
+        # Preserve coverage for the whole module for comments/formatting edits.
         try:
-            old_key = module_key("\n".join(old_lines), path)
+            old_source = "\n".join(old_lines)
             patched = apply_hunks(old_lines, [hunk])
-            new_key = module_key("\n".join(patched), path)
-            if old_key == new_key:
-                return set()
+            new_source = "\n".join(patched)
+            if old_source != new_source and module_key(old_source, path) == module_key(new_source, path):
+                return self.source_reader_tests(path)
         except (SyntaxError, ValueError):
             pass
 
@@ -426,12 +491,18 @@ class Analyzer:
         if not funcs:
             stmts = [n for n in new_chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
-            defining = (path, max(point - 1, 1), point)
+            # The inserted definition is absent from the original source tree.
+            # Do not exclude adjacent original lines: they may contain real readers.
+            defining = (path, 0, -1)
             # Find matching class in old tree
             classes = [n for n in new_chain if isinstance(n, ast.ClassDef)]
             if classes:
                 old_cls = self._find_scope(old_tree, [c.name for c in classes])
                 broad = self.broad_selection(path, [old_cls] if old_cls else [])
+                if is_narrowable_assignment(stmt):
+                    class_tests = self.class_users(path, classes)
+                    if class_tests:
+                        broad = class_tests
             else:
                 broad = self.broad_selection(path, [])
             return self.narrow_selection(path, stmt, defining, broad)
