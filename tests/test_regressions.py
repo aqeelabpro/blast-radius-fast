@@ -315,6 +315,69 @@ class ImpactRegressionTests(unittest.TestCase):
             self.assertEqual(analyzer.source_reader_tests("sqlglot/example.py"), {1, 2, 3})
 
 
+    def test_test_helper_change_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/tests/conftest.py b/tests/conftest.py\\n"
+                "--- a/tests/conftest.py\\n"
+                "+++ b/tests/conftest.py\\n"
+                "@@ -1 +1 @@\\n"
+                "-VALUE = 1\\n"
+                "+VALUE = 2\\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_unmapped_test_asset_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/tests/data/new.json b/tests/data/new.json\\n"
+                "new file mode 100644\\n"
+                "--- /dev/null\\n"
+                "+++ b/tests/data/new.json\\n"
+                "@@ -0,0 +1 @@\\n"
+                "+{}\\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_unknown_root_config_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/pyproject.toml b/pyproject.toml\\n"
+                "--- a/pyproject.toml\\n"
+                "+++ b/pyproject.toml\\n"
+                "@@ -1 +1 @@\\n"
+                "-[tool.pytest]\\n"
+                "+[tool.pytest.ini_options]\\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_unknown_fixture_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/tests/fixtures/unmapped/new.sql b/tests/fixtures/unmapped/new.sql\\n"
+                "new file mode 100644\\n"
+                "--- /dev/null\\n"
+                "+++ b/tests/fixtures/unmapped/new.sql\\n"
+                "@@ -0,0 +1 @@\\n"
+                "+SELECT 1\\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_rename_from_ignored_doc_to_config_is_not_ignored(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/docs/settings.md b/pyproject.toml\\n"
+                "similarity index 100%\\n"
+                "rename from docs/settings.md\\n"
+                "rename to pyproject.toml\\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
     def test_comment_only_source_change_keeps_module_tests(self):
         import tempfile
         from pathlib import Path
