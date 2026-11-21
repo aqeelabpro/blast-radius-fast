@@ -14,7 +14,7 @@ os.rename(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 EOF
 
 COPY selector.py /app/selector.py
-COPY br /app/br
+COPY analysis /app/analysis
 COPY maps /app/maps
 COPY pickle_maps.py /tmp/pickle_maps.py
 RUN python /tmp/pickle_maps.py /app/maps

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FAST Team - Test Selection for sqlglot patches
-Determines minimal test set needed to catch regressions using coverage analysis.
+FAST Team - Blast Radius Test Selector
+Selects minimal test set for sqlglot patches using line-level coverage analysis.
 """
 from __future__ import annotations
 
@@ -16,129 +16,115 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from br.diff import parse_patch
-from br.impact import ALL, Analyzer, Maps
-from br.importcheck import ImportChecker
-from br.schedule import split
+from analysis.diff import parse_patch
+from analysis.impact import ALL, Analyzer, Maps
+from analysis.importcheck import ImportChecker
+from analysis.schedule import split
 
+# Paths
 INPUT_DIR = Path(os.environ.get("BR_DATA", "/data"))
 SQLGLOT_DIR = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 MAPS_DIR = Path(os.environ.get("BR_MAPS", str(ROOT / "maps")))
 
 
-def stderr(msg: str) -> None:
-    """Write diagnostic message to stderr."""
+def log(msg: str):
+    """Log to stderr."""
     print(msg, file=sys.stderr)
 
 
-def load_json_map(filename: str):
-    """Load a map file, preferring pickled version for speed."""
-    base = filename.removesuffix(".gz").removesuffix(".json")
-    pkl_path = MAPS_DIR / f"{base}.pickle"
+def load_map(name: str):
+    """Load map file, preferring pickle for speed."""
+    stem = name.removesuffix(".gz").removesuffix(".json")
+    pkl = MAPS_DIR / f"{stem}.pickle"
 
-    if pkl_path.exists():
-        with open(pkl_path, "rb") as fh:
-            return pickle.load(fh)
+    if pkl.exists():
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
 
-    json_path = MAPS_DIR / filename
-    if not json_path.exists():
+    path = MAPS_DIR / name
+    if not path.exists():
         return None
 
-    open_fn = gzip.open if filename.endswith(".gz") else open
-    with open_fn(json_path, "rt", encoding="utf-8") as fh:
-        return json.load(fh)
+    opener = gzip.open if name.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def build_maps(test_list: list[dict]) -> Maps:
-    """Construct Maps object from loaded coverage data."""
-    cov_data = load_json_map("coverage.json.gz")
-
+def build_maps(tests: list) -> Maps:
+    """Build Maps object from loaded data."""
+    # Load coverage with int keys
+    raw_cov = load_map("coverage.json.gz")
     if (MAPS_DIR / "coverage.pickle").exists():
-        cov_map = cov_data
+        coverage = raw_cov
     else:
-        cov_map = {
-            fpath: {int(line): tests for line, tests in lines.items()}
-            for fpath, lines in cov_data.items()
+        coverage = {
+            path: {int(ln): nums for ln, nums in lines.items()}
+            for path, lines in raw_cov.items()
         }
 
-    tests_per_file: dict[str, set[int]] = defaultdict(set)
-    for t in test_list:
-        tests_per_file[t["file"]].add(t["number"])
+    # Build test-by-file index
+    by_file: dict = defaultdict(set)
+    for t in tests:
+        by_file[t["file"]].add(t["number"])
 
     return Maps(
-        coverage=cov_map,
-        fixtures=load_json_map("fixtures.json") or {},
-        tests_by_file=dict(tests_per_file),
-        classes=load_json_map("classes.json.gz") or {},
-        enums=frozenset(load_json_map("enums.json") or ()),
-        import_lines=load_json_map("import_lines.json") or {},
-        import_groups=load_json_map("import_groups.json.gz") or {},
+        coverage=coverage,
+        fixtures=load_map("fixtures.json") or {},
+        tests_by_file=dict(by_file),
+        classes=load_map("classes.json.gz") or {},
+        enums=frozenset(load_map("enums.json") or ()),
+        import_lines=load_map("import_lines.json") or {},
+        import_groups=load_map("import_groups.json.gz") or {},
     )
 
 
-def determine_tests(analyzer: Analyzer, patch_content: str, all_tests: set[int],
-                    mod_list: list[str], import_checker: ImportChecker) -> set[int]:
-    """Analyze patch and return set of tests that could be affected."""
-    affected: set[int] = set()
+def select_tests(analyzer: Analyzer, patch: str, all_nums: set, checker: ImportChecker) -> set:
+    """Analyze patch and return tests to run."""
+    selected: set = set()
     analyzer.import_time = {}
 
-    for diff in parse_patch(patch_content):
+    for diff in parse_patch(patch):
         result = analyzer.tests_for(diff)
         if result is ALL:
-            return set(all_tests)
-        affected |= result
+            return set(all_nums)
+        selected |= result
 
-    if analyzer.import_time and import_checker.crashes(analyzer.import_time):
-        stderr("  detected import-time issue, running all tests")
-        return set(all_tests)
+    # Check for import-time crashes
+    if analyzer.import_time and checker.crashes(analyzer.import_time):
+        log("  import crash detected, running all")
+        return set(all_nums)
 
-    return affected & all_tests
-
-
-def get_collection_modules() -> list[str]:
-    """Get module names imported during test collection."""
-    imports_file = MAPS_DIR / "collect_imports.json"
-    if not imports_file.exists():
-        return []
-
-    result = []
-    for path in json.loads(imports_file.read_text()):
-        mod = path[:-3].replace("/", ".")
-        if mod.endswith(".__init__"):
-            mod = mod[:-9]
-        result.append(mod)
-    return result
+    return selected & all_nums
 
 
-def run():
-    """Main entry point."""
-    test_data = json.loads((INPUT_DIR / "tests.json").read_text())["tests"]
+def main():
+    # Load test data
+    tests = json.loads((INPUT_DIR / "tests.json").read_text())["tests"]
+    runtimes = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    all_nums = set(runtimes)
 
-    runtimes = {t["number"]: round(t["seconds"] * 1000) for t in test_data}
-    all_test_nums = set(runtimes)
+    # Initialize
+    analyzer = Analyzer(SQLGLOT_DIR, build_maps(tests))
+    checker = ImportChecker(SQLGLOT_DIR, [], {})
 
-    analysis = Analyzer(SQLGLOT_DIR, build_maps(test_data))
-    modules = get_collection_modules()
-    checker = ImportChecker(SQLGLOT_DIR, modules, analysis.maps.import_groups.get("dependents", {}))
-
-    commits_path = INPUT_DIR / "commits"
-    for patch_file in sorted(commits_path.glob("*.patch")):
-        commit_id = patch_file.stem
+    # Process patches
+    for patch_file in sorted((INPUT_DIR / "commits").glob("*.patch")):
+        cid = patch_file.stem
 
         try:
             content = patch_file.read_text(encoding="utf-8", errors="replace")
-            selected = determine_tests(analysis, content, all_test_nums, modules, checker)
-        except Exception as err:
-            stderr(f"{commit_id}: error ({type(err).__name__}: {err}), running all")
-            selected = set(all_test_nums)
+            selected = select_tests(analyzer, content, all_nums, checker)
+        except Exception as e:
+            log(f"{cid}: ERROR {e}, running all")
+            selected = set(all_nums)
 
-        worker_assignment = split(selected, runtimes)
-        print(json.dumps({"commit": commit_id, "workers": worker_assignment}))
-        stderr(f"{commit_id}: {len(selected)} tests")
+        workers = split(selected, runtimes)
+        print(json.dumps({"commit": cid, "workers": workers}))
+        log(f"{cid}: {len(selected)} tests")
 
     checker.close()
     sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    run()
+    main()
