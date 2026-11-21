@@ -364,10 +364,11 @@ class Analyzer:
         # tests. Unknown test-tree changes therefore require the full suite.
         if any(p.startswith("tests/") for p in paths):
             return ALL
-        path = diff.path
-        if any(path.endswith(ext) for ext in SKIP_EXTS):
-            return set()
-        if any(path.startswith(d) for path in paths for d in SKIP_DIRS):
+        # Ignore a rename only when both sides are known non-runtime content.
+        def ignored(candidate: str) -> bool:
+            return candidate.endswith(SKIP_EXTS) or candidate.startswith(SKIP_DIRS)
+
+        if paths and all(ignored(candidate) for candidate in paths):
             return set()
         # Unknown root/package/config files may affect imports or test collection.
         return ALL
