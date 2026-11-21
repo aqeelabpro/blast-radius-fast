@@ -6,6 +6,37 @@ from analysis.diff import Hunk, apply_hunks, parse_patch
 from analysis.impact import ALL, Analyzer, Maps
 from analysis.equiv import Equivalence
 from analysis.readers import ReaderIndex
+from analysis.schedule import split
+
+
+class ScheduleRegressionTests(unittest.TestCase):
+    def test_free_tests_fill_slack_without_increasing_makespan(self):
+        runtimes = {1: 8000, 2: 4000, 3: 3000, 4: 700, 5: 300, 6: 2500}
+        files = {
+            1: "tests/test_a.py",
+            2: "tests/test_b.py",
+            3: "tests/test_b.py",
+            4: "tests/test_b.py",
+            5: "tests/test_c.py",
+            6: "tests/test_d.py",
+        }
+        selected = {1, 2, 3}
+        base = split(selected, runtimes)
+        augmented = split(selected, runtimes, set(runtimes), files)
+
+        base_peak = max(sum(runtimes[n] for n in worker) for worker in base)
+        augmented_peak = max(sum(runtimes[n] for n in worker) for worker in augmented)
+        flattened = [n for worker in augmented for n in worker]
+
+        self.assertEqual(augmented_peak, base_peak)
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertTrue(selected.issubset(set(flattened)))
+        self.assertIn(4, flattened)
+        self.assertIn(5, flattened)
+        self.assertNotIn(6, flattened)
+
+    def test_empty_required_selection_stays_empty(self):
+        self.assertEqual(split(set(), {1: 100}, {1}), [])
 
 
 class DiffRegressionTests(unittest.TestCase):
