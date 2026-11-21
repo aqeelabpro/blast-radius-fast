@@ -64,30 +64,58 @@ def find_next_code_line(lines: List[str], idx: int, direction: int) -> Optional[
     return None
 
 
-def is_literal_value(node: Optional[ast.AST]) -> bool:
-    """Return True only for side-effect-free literal values."""
+def _safe_numeric_unary(node: ast.AST) -> bool:
+    """Check unary numeric operations without accepting expressions that raise."""
+    if not isinstance(node, ast.UnaryOp) or not isinstance(node.operand, ast.Constant):
+        return False
+    value = node.operand.value
+    if isinstance(node.op, (ast.UAdd, ast.USub)):
+        return type(value) in (int, float, complex)
+    if isinstance(node.op, ast.Invert):
+        return type(value) is int
+    return False
+
+
+def _is_hashable_literal(node: ast.AST) -> bool:
+    """Whether a literal expression is both safe to evaluate and hashable."""
     if isinstance(node, ast.Constant):
         return True
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
-        return isinstance(node.operand, ast.Constant) and isinstance(
-            node.operand.value, (int, float, complex)
-        )
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+    if isinstance(node, ast.UnaryOp):
+        return _safe_numeric_unary(node)
+    if isinstance(node, ast.Tuple):
+        return all(_is_hashable_literal(item) for item in node.elts)
+    return False
+
+
+def is_literal_value(node: Optional[ast.AST]) -> bool:
+    """Return True only for literal expressions that cannot invoke user code or raise."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp):
+        return _safe_numeric_unary(node)
+    if isinstance(node, (ast.Tuple, ast.List)):
         return all(is_literal_value(item) for item in node.elts)
+    if isinstance(node, ast.Set):
+        return all(_is_hashable_literal(item) for item in node.elts)
     if isinstance(node, ast.Dict):
+        # A None key represents **mapping unpacking, which can execute arbitrary code.
         return all(
-            (key is None or is_literal_value(key)) and is_literal_value(value)
+            key is not None and _is_hashable_literal(key) and is_literal_value(value)
             for key, value in zip(node.keys, node.values)
         )
     return False
 
 
 def is_narrowable_assignment(stmt: Optional[ast.AST]) -> bool:
-    """Only narrow assignments whose evaluation cannot have side effects."""
+    """Only narrow plain-name assignments with safe, non-raising literal values."""
+    names = get_assigned_names(stmt) if stmt is not None else None
+    if not names or any(name.startswith("__") and name.endswith("__") for name in names):
+        return False
     if isinstance(stmt, ast.Assign):
         return is_literal_value(stmt.value)
     if isinstance(stmt, ast.AnnAssign):
-        return is_literal_value(stmt.value) and isinstance(stmt.annotation, (ast.Name, ast.Constant))
+        # A Name annotation is evaluated at import time and may raise NameError.
+        return is_literal_value(stmt.value) and isinstance(stmt.annotation, ast.Constant)
     return False
 
 
