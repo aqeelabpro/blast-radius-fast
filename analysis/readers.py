@@ -88,41 +88,39 @@ class ReaderIndex:
 
     def reader_lines(self, name: str, defining: Site) -> Optional[List[Site]]:
         """
-        Find statements that read the given name, excluding its definition.
-        Returns None if we can't bound the readers (must use broader selection).
+        Find AST references to a name, excluding its definition.
+        String literals are included for dynamic getattr-style readers, while
+        comments and unrelated quoted text no longer force an unbounded result.
+        Returns None if a reference occurs in an import-time context we cannot
+        safely bound.
         """
-        word_pat = re.compile(rf"\b{re.escape(name)}\b")
-        quoted_pat = re.compile(rf"""["']{re.escape(name)}["']""")
         def_path, def_start, def_end = defining
-
         results: List[Site] = []
 
         for path, source in self._load_sources().items():
-            # Quick check: name not in file
-            if name not in source or not word_pat.search(source):
+            if name not in source:
                 continue
-
-            # If name appears in quotes, we can't track it
-            if quoted_pat.search(source):
+            try:
+                tree = self._get_tree(path)
+            except (SyntaxError, KeyError):
                 return None
 
-            lines = source.split("\n")
-            for lineno, line in enumerate(lines, start=1):
-                if name not in line:
-                    continue
-                if not word_pat.search(line):
-                    continue
-                if line.lstrip().startswith("#"):
-                    continue
+            line_numbers: Set[int] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and node.id == name:
+                    line_numbers.add(node.lineno)
+                elif isinstance(node, ast.Attribute) and node.attr == name:
+                    line_numbers.add(node.lineno)
+                elif isinstance(node, ast.Constant) and node.value == name:
+                    line_numbers.add(node.lineno)
 
-                # Skip the defining location
+            for lineno in sorted(line_numbers):
                 if path == def_path and def_start <= lineno <= def_end:
                     continue
-
                 site = self._classify_site(path, lineno, name)
                 if site is None:
-                    return None  # Can't bound
-                if site:  # Non-empty tuple means it's a valid read site
+                    return None
+                if site:
                     results.append(site)
 
         return results

@@ -1,6 +1,6 @@
 """
 FAST Team - Semantic equivalence checking
-Uses bytecode comparison and text canonicalization to detect non-semantic changes.
+Uses bytecode comparison for safe whole-module equivalence checks.
 """
 from __future__ import annotations
 import re
@@ -8,15 +8,6 @@ import types
 from typing import FrozenSet
 
 from analysis.diff import Hunk
-
-# Files where == None has different semantics than is None
-UNSAFE_EQ_FILES = ("sqlglot/executor/env.py",)
-
-# Patterns for None comparison normalization
-PAT_NONE_EQ_RIGHT = re.compile(r"==\s*None\b")
-PAT_NONE_NE_RIGHT = re.compile(r"!=\s*None\b")
-PAT_NONE_EQ_LEFT = re.compile(r"\bNone\s*==")
-PAT_NONE_NE_LEFT = re.compile(r"\bNone\s*!=")
 
 
 def _extract_code_signature(code: types.CodeType) -> tuple:
@@ -39,46 +30,34 @@ def module_key(source, path: str) -> tuple:
 
 
 class Equivalence:
-    """Checks if changes are semantically equivalent."""
+    """Conservative semantic-equivalence checks."""
 
     def __init__(self, enums: FrozenSet[str]):
-        # Build patterns for enum identity comparison
-        if enums:
-            enum_names = "|".join(map(re.escape, sorted(enums)))
-            self.pat_enum_eq = re.compile(r"==(\s*)(" + enum_names + r")\.")
-            self.pat_enum_ne = re.compile(r"!=(\s*)(" + enum_names + r")\.")
-        else:
-            self.pat_enum_eq = None
-            self.pat_enum_ne = None
-
-    def canonicalize(self, line: str) -> str:
-        """Normalize comparison operators to canonical form."""
-        # Convert == None to is None
-        line = PAT_NONE_EQ_RIGHT.sub("is None", line)
-        line = PAT_NONE_NE_RIGHT.sub("is not None", line)
-        line = PAT_NONE_EQ_LEFT.sub("None is", line)
-        line = PAT_NONE_NE_LEFT.sub("None is not", line)
-
-        # Convert enum == to is
-        if self.pat_enum_eq:
-            line = self.pat_enum_eq.sub(r"is\1\2.", line)
-            line = self.pat_enum_ne.sub(r"is not\1\2.", line)
-
-        # Normalize whitespace
-        return " ".join(line.split())
+        self.enums = enums
 
     def same_hunk_text(self, hunk: Hunk, path: str) -> bool:
-        """Check if hunk only changes equivalent comparison forms."""
-        if path in UNSAFE_EQ_FILES:
-            return False
+        """Accept identical text and a small set of type-proven equivalences."""
+        def canonicalize(line: str) -> str:
+            # Dialect.__init__ always converts this setting to the
+            # NormalizationStrategy enum; built-in dialect defaults are enum
+            # members too. Comparing two members of this enum is identity-safe.
+            if path == "sqlglot/dialects/dialect.py" and "NormalizationStrategy" in self.enums:
+                line = re.sub(
+                    r"\bself\.normalization_strategy\s*==\s*(NormalizationStrategy\.\w+)\b",
+                    r"self.normalization_strategy is \1",
+                    line,
+                )
 
-        removed = [ln[1:] for ln in hunk.lines if ln.startswith("-")]
-        added = [ln[1:] for ln in hunk.lines if ln.startswith("+")]
+            # Context._table is Table | None. The pinned Table class does not
+            # override __eq__, so object equality against None is identity-safe.
+            if path == "sqlglot/executor/context.py":
+                line = re.sub(
+                    r"\bself\._table\s*==\s*None\b",
+                    "self._table is None",
+                    line,
+                )
+            return line
 
-        if not removed or len(removed) != len(added):
-            return False
-
-        return all(
-            self.canonicalize(r) == self.canonicalize(a)
-            for r, a in zip(removed, added)
-        )
+        removed = [canonicalize(line[1:]) for line in hunk.lines if line.startswith("-")]
+        added = [canonicalize(line[1:]) for line in hunk.lines if line.startswith("+")]
+        return bool(removed) and removed == added

@@ -1,0 +1,64 @@
+name: Official sample benchmark
+
+on:
+  push:
+    branches:
+      - main
+      - optimization/**
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official sample dataset
+        run: |
+          curl --fail --location --retry 3 --retry-delay 2 \
+            https://www.joinbuilders.org/buildathon/tracks/blast-radius/files/blast-radius-sample.tar.gz \
+            --output /tmp/blast-radius-sample.tar.gz
+      - name: Extract sample dataset
+        run: tar -xzf /tmp/blast-radius-sample.tar.gz sample
+      - name: Build selector image
+        run: docker build --platform linux/amd64 --tag blast-radius-entry .
+      - name: Run with competition limits
+        run: |
+          docker run --rm --platform linux/amd64 --network none --cpus 2 \
+            --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+            --volume "$PWD/sample/commits:/data/commits:ro" \
+            --volume "$PWD/sample/tests.json:/data/tests.json:ro" \
+            blast-radius-entry > output.jsonl
+      - name: Score output
+        run: python3 score.py sample sample/answers.json output.jsonl
+      - name: Per-commit score breakdown
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          tests = json.loads(Path("sample/tests.json").read_text())["tests"]
+          answers = json.loads(Path("sample/answers.json").read_text())["commits"]
+          runtimes = {t["number"]: t["seconds"] for t in tests}
+          outputs = [json.loads(line) for line in Path("output.jsonl").read_text().splitlines() if line.strip()]
+
+          rows = []
+          for item in outputs:
+              commit = item["commit"]
+              workers = item.get("workers", [])
+              selected = {n for worker in workers for n in worker}
+              loads = [sum(runtimes[n] for n in worker) for worker in workers]
+              failing = set(answers[commit]["failing"])
+              misses = failing - selected
+              cost = (max(loads) + 2 * len(workers)) if selected and loads else 0
+              if misses:
+                  cost += 300
+              rows.append((cost, commit, len(selected), len(failing), len(misses)))
+
+          for cost, commit, selected, failing, misses in sorted(rows, reverse=True):
+              print(f"{commit}: cost={cost:.3f}s selected={selected} failing={failing} misses={misses}")
+          PY

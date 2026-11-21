@@ -67,6 +67,19 @@ def build_maps(tests: list) -> Maps:
     for t in tests:
         by_file[t["file"]].add(t["number"])
 
+    raw_source_readers = load_map("source_readers.json")
+    source_readers = None
+    source_reader_unknown: set = set()
+    if raw_source_readers is not None:
+        source_readers = {}
+        for path, test_files in raw_source_readers.get("files", {}).items():
+            selected: set = set()
+            for test_file in test_files:
+                selected |= by_file.get(test_file, set())
+            source_readers[path] = selected
+        for test_file in raw_source_readers.get("unknown_test_files", ()):
+            source_reader_unknown |= by_file.get(test_file, set())
+
     return Maps(
         coverage=coverage,
         fixtures=load_map("fixtures.json") or {},
@@ -75,6 +88,8 @@ def build_maps(tests: list) -> Maps:
         enums=frozenset(load_map("enums.json") or ()),
         import_lines=load_map("import_lines.json") or {},
         import_groups=load_map("import_groups.json.gz") or {},
+        source_readers=source_readers,
+        source_reader_unknown=source_reader_unknown,
     )
 
 

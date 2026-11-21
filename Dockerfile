@@ -17,7 +17,9 @@ COPY selector.py /app/selector.py
 COPY analysis /app/analysis
 COPY maps /app/maps
 COPY pickle_maps.py /tmp/pickle_maps.py
+COPY build_source_reader_map.py /tmp/build_source_reader_map.py
 RUN python /tmp/pickle_maps.py /app/maps
+RUN python /tmp/build_source_reader_map.py /opt/sqlglot /app/maps
 RUN python -m compileall -q /app /opt/sqlglot/sqlglot && chmod -R a+rX /app /opt/sqlglot
 
 ENV BR_SQLGLOT=/opt/sqlglot
