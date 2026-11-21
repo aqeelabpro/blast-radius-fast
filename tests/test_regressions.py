@@ -7,6 +7,38 @@ from analysis.impact import ALL, Analyzer, Maps
 from analysis.equiv import Equivalence
 from analysis.readers import ReaderIndex
 from analysis.schedule import split
+from analysis.impact import is_literal_value, is_narrowable_assignment
+
+
+class LiteralSafetyRegressionTests(unittest.TestCase):
+    def expression(self, source):
+        import ast
+        return ast.parse("VALUE = " + source).body[0].value
+
+    def test_dict_unpacking_is_not_treated_as_a_pure_literal(self):
+        self.assertFalse(is_literal_value(self.expression("{**mapping}")))
+
+    def test_unhashable_set_element_is_not_treated_as_a_pure_literal(self):
+        self.assertFalse(is_literal_value(self.expression("{[1]}")))
+
+    def test_unhashable_dictionary_key_is_not_treated_as_a_pure_literal(self):
+        self.assertFalse(is_literal_value(self.expression("{[1]: 2}")))
+
+    def test_bitwise_invert_of_float_is_not_treated_as_safe(self):
+        self.assertFalse(is_literal_value(self.expression("~1.0")))
+
+    def test_valid_nested_literal_containers_remain_supported(self):
+        self.assertTrue(is_literal_value(self.expression("{(1, 2): [3, 4]}")))
+
+    def test_unknown_annotation_is_not_narrowable(self):
+        import ast
+        stmt = ast.parse("VALUE: MissingType = 1").body[0]
+        self.assertFalse(is_narrowable_assignment(stmt))
+
+    def test_magic_class_attributes_are_not_narrowable(self):
+        import ast
+        stmt = ast.parse("__slots__ = ('value',)").body[0]
+        self.assertFalse(is_narrowable_assignment(stmt))
 
 
 class ScheduleRegressionTests(unittest.TestCase):
