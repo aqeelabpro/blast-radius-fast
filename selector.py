@@ -52,7 +52,6 @@ def load_map(name: str):
 
 def build_maps(tests: list) -> Maps:
     """Build Maps object from loaded data."""
-    # Load coverage with int keys
     raw_cov = load_map("coverage.json.gz")
     if (MAPS_DIR / "coverage.pickle").exists():
         coverage = raw_cov
@@ -62,7 +61,6 @@ def build_maps(tests: list) -> Maps:
             for path, lines in raw_cov.items()
         }
 
-    # Build test-by-file index
     by_file: dict = defaultdict(set)
     for t in tests:
         by_file[t["file"]].add(t["number"])
@@ -104,7 +102,6 @@ def select_tests(analyzer: Analyzer, patch: str, all_nums: set, checker: ImportC
             return set(all_nums)
         selected |= result
 
-    # Check for import-time crashes
     if analyzer.import_time and checker.crashes(analyzer.import_time):
         log("  import crash detected, running all")
         return set(all_nums)
@@ -113,19 +110,16 @@ def select_tests(analyzer: Analyzer, patch: str, all_nums: set, checker: ImportC
 
 
 def main():
-    # Load test data
     tests = json.loads((INPUT_DIR / "tests.json").read_text())["tests"]
     runtimes = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     all_nums = set(runtimes)
+    test_file_by_num = {t["number"]: t["file"] for t in tests}
 
-    # Initialize
     analyzer = Analyzer(SQLGLOT_DIR, build_maps(tests))
     checker = ImportChecker(SQLGLOT_DIR, [], {})
 
-    # Process patches
     for patch_file in sorted((INPUT_DIR / "commits").glob("*.patch")):
         cid = patch_file.stem
-
         try:
             content = patch_file.read_text(encoding="utf-8", errors="replace")
             selected = select_tests(analyzer, content, all_nums, checker)
@@ -133,9 +127,9 @@ def main():
             log(f"{cid}: ERROR {e}, running all")
             selected = set(all_nums)
 
-        workers = split(selected, runtimes)
+        workers = split(selected, runtimes, all_nums, test_file_by_num)
         print(json.dumps({"commit": cid, "workers": workers}))
-        log(f"{cid}: {len(selected)} tests")
+        log(f"{cid}: {len(selected)} required tests, {sum(len(w) for w in workers)} scheduled")
 
     checker.close()
     sys.stdout.flush()

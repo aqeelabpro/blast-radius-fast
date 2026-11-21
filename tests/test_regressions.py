@@ -6,6 +6,69 @@ from analysis.diff import Hunk, apply_hunks, parse_patch
 from analysis.impact import ALL, Analyzer, Maps
 from analysis.equiv import Equivalence
 from analysis.readers import ReaderIndex
+from analysis.schedule import split
+from analysis.impact import is_literal_value, is_narrowable_assignment
+
+
+class LiteralSafetyRegressionTests(unittest.TestCase):
+    def expression(self, source):
+        import ast
+        return ast.parse("VALUE = " + source).body[0].value
+
+    def test_dict_unpacking_is_not_treated_as_a_pure_literal(self):
+        self.assertFalse(is_literal_value(self.expression("{**mapping}")))
+
+    def test_unhashable_set_element_is_not_treated_as_a_pure_literal(self):
+        self.assertFalse(is_literal_value(self.expression("{[1]}")))
+
+    def test_unhashable_dictionary_key_is_not_treated_as_a_pure_literal(self):
+        self.assertFalse(is_literal_value(self.expression("{[1]: 2}")))
+
+    def test_bitwise_invert_of_float_is_not_treated_as_safe(self):
+        self.assertFalse(is_literal_value(self.expression("~1.0")))
+
+    def test_valid_nested_literal_containers_remain_supported(self):
+        self.assertTrue(is_literal_value(self.expression("{(1, 2): [3, 4]}")))
+
+    def test_unknown_annotation_is_not_narrowable(self):
+        import ast
+        stmt = ast.parse("VALUE: MissingType = 1").body[0]
+        self.assertFalse(is_narrowable_assignment(stmt))
+
+    def test_magic_class_attributes_are_not_narrowable(self):
+        import ast
+        stmt = ast.parse("__slots__ = ('value',)").body[0]
+        self.assertFalse(is_narrowable_assignment(stmt))
+
+
+class ScheduleRegressionTests(unittest.TestCase):
+    def test_free_tests_fill_slack_without_increasing_makespan(self):
+        runtimes = {1: 8000, 2: 4000, 3: 3000, 4: 700, 5: 300, 6: 2500}
+        files = {
+            1: "tests/test_a.py",
+            2: "tests/test_b.py",
+            3: "tests/test_b.py",
+            4: "tests/test_b.py",
+            5: "tests/test_c.py",
+            6: "tests/test_d.py",
+        }
+        selected = {1, 2, 3}
+        base = split(selected, runtimes)
+        augmented = split(selected, runtimes, set(runtimes), files)
+
+        base_peak = max(sum(runtimes[n] for n in worker) for worker in base)
+        augmented_peak = max(sum(runtimes[n] for n in worker) for worker in augmented)
+        flattened = [n for worker in augmented for n in worker]
+
+        self.assertEqual(augmented_peak, base_peak)
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertTrue(selected.issubset(set(flattened)))
+        self.assertIn(4, flattened)
+        self.assertIn(5, flattened)
+        self.assertNotIn(6, flattened)
+
+    def test_empty_required_selection_stays_empty(self):
+        self.assertEqual(split(set(), {1: 100}, {1}), [])
 
 
 class DiffRegressionTests(unittest.TestCase):
@@ -251,6 +314,69 @@ class ImpactRegressionTests(unittest.TestCase):
             analyzer = Analyzer(root, maps)
             self.assertEqual(analyzer.source_reader_tests("sqlglot/example.py"), {1, 2, 3})
 
+
+    def test_test_helper_change_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/tests/conftest.py b/tests/conftest.py\n"
+                "--- a/tests/conftest.py\n"
+                "+++ b/tests/conftest.py\n"
+                "@@ -1 +1 @@\n"
+                "-VALUE = 1\n"
+                "+VALUE = 2\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_unmapped_test_asset_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/tests/data/new.json b/tests/data/new.json\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/tests/data/new.json\n"
+                "@@ -0,0 +1 @@\n"
+                "+{}\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_unknown_root_config_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/pyproject.toml b/pyproject.toml\n"
+                "--- a/pyproject.toml\n"
+                "+++ b/pyproject.toml\n"
+                "@@ -1 +1 @@\n"
+                "-[tool.pytest]\n"
+                "+[tool.pytest.ini_options]\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_unknown_fixture_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/tests/fixtures/unmapped/new.sql b/tests/fixtures/unmapped/new.sql\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/tests/fixtures/unmapped/new.sql\n"
+                "@@ -0,0 +1 @@\n"
+                "+SELECT 1\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
+
+    def test_rename_from_ignored_doc_to_config_is_not_ignored(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = self.make_analyzer(root)
+            diff = parse_patch(
+                "diff --git a/docs/settings.md b/pyproject.toml\n"
+                "similarity index 100%\n"
+                "rename from docs/settings.md\n"
+                "rename to pyproject.toml\n"
+            )[0]
+            self.assertIs(analyzer.tests_for(diff), ALL)
 
     def test_comment_only_source_change_keeps_module_tests(self):
         import tempfile

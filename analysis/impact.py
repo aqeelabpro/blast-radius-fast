@@ -64,30 +64,58 @@ def find_next_code_line(lines: List[str], idx: int, direction: int) -> Optional[
     return None
 
 
-def is_literal_value(node: Optional[ast.AST]) -> bool:
-    """Return True only for side-effect-free literal values."""
+def _safe_numeric_unary(node: ast.AST) -> bool:
+    """Check unary numeric operations without accepting expressions that raise."""
+    if not isinstance(node, ast.UnaryOp) or not isinstance(node.operand, ast.Constant):
+        return False
+    value = node.operand.value
+    if isinstance(node.op, (ast.UAdd, ast.USub)):
+        return type(value) in (int, float, complex)
+    if isinstance(node.op, ast.Invert):
+        return type(value) is int
+    return False
+
+
+def _is_hashable_literal(node: ast.AST) -> bool:
+    """Whether a literal expression is both safe to evaluate and hashable."""
     if isinstance(node, ast.Constant):
         return True
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
-        return isinstance(node.operand, ast.Constant) and isinstance(
-            node.operand.value, (int, float, complex)
-        )
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+    if isinstance(node, ast.UnaryOp):
+        return _safe_numeric_unary(node)
+    if isinstance(node, ast.Tuple):
+        return all(_is_hashable_literal(item) for item in node.elts)
+    return False
+
+
+def is_literal_value(node: Optional[ast.AST]) -> bool:
+    """Return True only for literal expressions that cannot invoke user code or raise."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp):
+        return _safe_numeric_unary(node)
+    if isinstance(node, (ast.Tuple, ast.List)):
         return all(is_literal_value(item) for item in node.elts)
+    if isinstance(node, ast.Set):
+        return all(_is_hashable_literal(item) for item in node.elts)
     if isinstance(node, ast.Dict):
+        # A None key represents **mapping unpacking, which can execute arbitrary code.
         return all(
-            (key is None or is_literal_value(key)) and is_literal_value(value)
+            key is not None and _is_hashable_literal(key) and is_literal_value(value)
             for key, value in zip(node.keys, node.values)
         )
     return False
 
 
 def is_narrowable_assignment(stmt: Optional[ast.AST]) -> bool:
-    """Only narrow assignments whose evaluation cannot have side effects."""
+    """Only narrow plain-name assignments with safe, non-raising literal values."""
+    names = get_assigned_names(stmt) if stmt is not None else None
+    if not names or any(name.startswith("__") and name.endswith("__") for name in names):
+        return False
     if isinstance(stmt, ast.Assign):
         return is_literal_value(stmt.value)
     if isinstance(stmt, ast.AnnAssign):
-        return is_literal_value(stmt.value) and isinstance(stmt.annotation, (ast.Name, ast.Constant))
+        # A Name annotation is evaluated at import time and may raise NameError.
+        return is_literal_value(stmt.value) and isinstance(stmt.annotation, ast.Constant)
     return False
 
 
@@ -177,8 +205,8 @@ class Analyzer:
             self._file_test_cache[path] = cached
         return set(cached)
 
-    def fixture_tests(self, path: str) -> Set[int]:
-        """Get tests using fixture."""
+    def fixture_tests(self, path: str) -> Optional[Set[int]]:
+        """Get tests using a fixture, or ALL when the dependency is unmapped."""
         if path in self.maps.fixtures:
             return set(self.maps.fixtures[path])
         parent = os.path.dirname(path) + "/"
@@ -186,7 +214,7 @@ class Analyzer:
         for fp, tests in self.maps.fixtures.items():
             if fp.startswith(parent):
                 result.update(tests)
-        return result
+        return result if result else ALL
 
     def module_tests(self, path: str) -> Optional[Set[int]]:
         """Get tests for a module, including dialect family."""
@@ -332,31 +360,39 @@ class Analyzer:
             return self._handle_sqlglot(diff)
         if any(p.startswith("tests/") and p.endswith(".py") for p in paths):
             return self._handle_test(diff)
-        path = diff.path
-        if any(path.endswith(ext) for ext in SKIP_EXTS):
-            return set()
-        if any(path.startswith(d) for d in SKIP_DIRS):
-            return set()
-        if diff.binary:
+        # Non-Python test assets outside the fixture map can still be loaded by
+        # tests. Unknown test-tree changes therefore require the full suite.
+        if any(p.startswith("tests/") for p in paths):
             return ALL
-        return set()
+        # Ignore a rename only when both sides are known non-runtime content.
+        def ignored(candidate: str) -> bool:
+            return candidate.endswith(SKIP_EXTS) or candidate.startswith(SKIP_DIRS)
 
-    def _handle_fixture(self, diff: FileDiff) -> Set[int]:
+        if paths and all(ignored(candidate) for candidate in paths):
+            return set()
+        # Unknown root/package/config files may affect imports or test collection.
+        return ALL
+
+    def _handle_fixture(self, diff: FileDiff) -> Optional[Set[int]]:
         """Handle fixture changes, including both sides of a rename."""
         paths = {p for p in (diff.old_path, diff.new_path) if p}
-        # Fixture contents can be expected output as well as input SQL. Even
-        # comment-only edits may invalidate snapshots, so never discard them.
         result: Set[int] = set()
         for candidate in paths:
-            result |= self.fixture_tests(candidate)
+            affected = self.fixture_tests(candidate)
+            if affected is ALL:
+                return ALL
+            result |= affected
         return result
 
-    def _handle_test(self, diff: FileDiff) -> Set[int]:
-        """Handle test file changes, including both sides of a rename."""
+    def _handle_test(self, diff: FileDiff) -> Optional[Set[int]]:
+        """Handle test modules and helpers, including both sides of a rename."""
         result: Set[int] = set()
         for candidate in (diff.old_path, diff.new_path):
             if candidate:
-                result |= self.maps.tests_by_file.get(candidate, set())
+                affected = self.module_tests(candidate)
+                if affected is ALL:
+                    return ALL
+                result |= affected
         return result
 
     def _handle_sqlglot(self, diff: FileDiff) -> Optional[Set[int]]:
